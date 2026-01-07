@@ -6,6 +6,7 @@ from chromadb.utils import embedding_functions
 import joblib
 from datetime import timedelta, datetime
 from groq import Groq
+import re  # Importante para ler a chuva do texto
 
 # --- CONFIGURAÇÃO ---
 st.set_page_config(page_title="AgroIA - Diagnóstico Inteligente", page_icon="🌾", layout="wide")
@@ -47,6 +48,20 @@ CICLO_MEDIO_DIAS = {
     "Abacaxi": 540, "Maracujá": 240, "Alface": 45
 }
 
+# --- NOVO: Contexto para a IA saber o que é perene ---
+TIPO_CULTURA = {
+    "Soja": "Ciclo Curto (Anual)",
+    "Milho": "Ciclo Curto (Anual)",
+    "Banana": "Perene (Produção contínua, início 1 ano)",
+    "Laranja": "Perene (Árvore - 1ª Safra Comercial em 3 a 4 anos)",
+    "Tomate Mesa": "Ciclo Curto (Hortaliça)",
+    "Cenoura": "Ciclo Curto (Hortaliça)",
+    "Pimentão": "Ciclo Curto (Hortaliça)",
+    "Abacaxi": "Ciclo Longo (18 meses)",
+    "Maracujá": "Semi-Perene (1 a 2 anos)",
+    "Alface": "Ciclo Curtíssimo"
+}
+
 # --- FUNÇÕES ---
 def get_decendio(data):
     mes = data.month
@@ -86,36 +101,52 @@ def carregar_chroma():
         return client.get_collection(name="manual_tecnico_agricola", embedding_function=emb_fn)
     except: return None
 
-# --- LLAMA 3.3 (CONSULTOR AGRÔNOMO) ---
+# --- LLAMA 3.3 (CONSULTOR AGRÔNOMO ESPECIALISTA) ---
 def consultar_llama_online(cultura, cidade, lucro, risco, clima_texto, area_calc):
     api_key = st.secrets.get("GROQ_API_KEY")
     if not api_key: return "⚠️ Erro: Chave de API da Groq não configurada."
 
     client = Groq(api_key=api_key)
 
-    prompt_usuario = f"""
-    Aja como um consultor agrônomo experiente.
+    # 1. Pega o detalhe do ciclo (ex: "Árvore - 3 anos")
+    info_ciclo = TIPO_CULTURA.get(cultura, "Ciclo Padrão")
     
-    CENÁRIO:
-    - Município: {cidade}
-    - Cultura: {cultura}
-    - Área Planejada: {area_calc:.1f} hectares
-    - Clima Atual: {clima_texto}
-    - Risco ZARC: {risco}%
-    - Estimativa de Lucro Total: R$ {lucro:,.2f}
+    # 2. Extrai a chuva do texto (Gambiarra inteligente para pegar o número)
+    # O texto vem como "Seco (1mm)" ou "Ideal (73mm)"
+    chuva_match = re.search(r'\((\d+)mm\)', clima_texto)
+    mm_chuva = int(chuva_match.group(1)) if chuva_match else 0
+    
+    # 3. Cria alerta de irrigação se for seco (< 30mm)
+    alerta_irrigacao = ""
+    if mm_chuva < 30:
+        alerta_irrigacao = "ALERTA CRÍTICO: Baixa chuva. Deixe claro que SEM IRRIGAÇÃO o plantio é inviável nesta data, pois a muda vai morrer."
 
-    REGRAS DE RESPOSTA:
-    1. Se o risco for > 30%, alerte sobre necessidade de manejo.
-    2. Comente se a área ({area_calc:.1f} ha) é uma escala boa para essa cultura.
-    3. Responda em Português, tom direto de negócios. (Máximo 2 frases).
+    prompt_usuario = f"""
+    Aja como um consultor agrônomo Sênior. Analise este cenário de investimento:
+    
+    DADOS TÉCNICOS:
+    - Município: {cidade}
+    - Cultura: {cultura} ({info_ciclo})
+    - Área: {area_calc:.1f} hectares
+    - Clima/Chuva Hoje: {clima_texto}
+    - {alerta_irrigacao}
+    
+    OBSERVAÇÃO IMPORTANTE:
+    O cálculo financeiro (R$ {lucro:,.0f}) é uma projeção anualizada de potencial produtivo.
+    Se a cultura for PERENE (Laranja, Café, etc), explique que esse lucro só vem com o pomar adulto e não no primeiro ano.
+
+    SUA RESPOSTA (Máximo 3 frases curtas e diretas):
+    1. Valide se o clima atual permite plantio (se precisar de água, fale).
+    2. Alerte sobre o tempo de retorno real (se for perene).
+    3. Dê um veredito final (Bom negócio ou Arriscado).
     """
 
     try:
         completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt_usuario}],
-            temperature=0.6,
-            max_tokens=300,
+            temperature=0.5, 
+            max_tokens=350,
         )
         return completion.choices[0].message.content
     except Exception as e:
@@ -206,9 +237,8 @@ def recomendar_cultura(df, modelo, cidade, area_input, orcamento_max, ignorar_li
     
     return pd.DataFrame(resultados), culturas_existentes
 
-# --- CARD PERSONALIZADO (FONTE AJUSTADA) ---
+# --- CARD PERSONALIZADO ---
 def card_metrica(titulo, valor, cor="#000000"):
-    # Mantive a fonte em 20px como você pediu
     st.markdown(f"""
     <div style="background-color: #f8f9fa; padding: 10px; border-radius: 8px; border: 1px solid #e9ecef; margin-bottom: 5px;">
         <p style="font-size: 12px; color: #6c757d; margin-bottom: 0px;">{titulo}</p>
@@ -272,9 +302,7 @@ def main():
                     </div>
                     """, unsafe_allow_html=True)
                     
-                    # --- CARDS COM FORMATAÇÃO PADRONIZADA ---
                     c1, c2, c3, c4, c5 = st.columns(5)
-                    # Agora usamos ,.2f para mostrar centavos, igual a uma tabela financeira
                     with c1: card_metrica("Lucro Líquido", f"R$ {campeao['Lucro']:,.2f}", "#198754")
                     with c2: card_metrica("ROI", f"{campeao['ROI']:.0f}%", "#0d6efd")
                     with c3: card_metrica("Investimento", f"R$ {campeao['Custo']:,.2f}", "#dc3545")
@@ -292,10 +320,8 @@ def main():
                     st.divider()
                     st.subheader("📊 Tabela Detalhada")
                     
-                    # --- FORMATAÇÃO DA TABELA PARA FICAR IGUAL AOS CARDS ---
                     df_view = df_bom[['Cultura', 'Area_Calc', 'Lucro', 'Custo', 'Risco', 'Obs', 'Clima']].copy()
                     
-                    # Aqui aplicamos a formatação de dinheiro
                     df_view['Lucro'] = df_view['Lucro'].apply(lambda x: f"R$ {x:,.2f}")
                     df_view['Custo'] = df_view['Custo'].apply(lambda x: f"R$ {x:,.2f}")
                     df_view['Area_Calc'] = df_view['Area_Calc'].apply(lambda x: f"{x:.1f} ha")
