@@ -1,8 +1,8 @@
 streamlit
 pandas
-groq
-chromadb
+numpy
+scikit-learn
 joblib
-pyarrow
-openpyxl
+chromadb
+groq
 pysqlite3-binary
