@@ -6,7 +6,7 @@ from chromadb.utils import embedding_functions
 import joblib
 from datetime import timedelta, datetime
 from groq import Groq
-import re  # Importante para ler a chuva do texto
+import re
 
 # --- CONFIGURAÇÃO ---
 st.set_page_config(page_title="AgroIA - Diagnóstico Inteligente", page_icon="🌾", layout="wide")
@@ -17,7 +17,7 @@ PARQUET_FILE = os.path.join(BASE_PATH, "data", "processed", "dataset_gold_mvp.pa
 MODEL_PATH = os.path.join(BASE_PATH, "models", "modelo_produtividade.joblib")
 DB_PATH = os.path.join(BASE_PATH, "data", "chroma_db")
 
-# --- DADOS ECONÔMICOS ---
+# --- DADOS ECONÔMICOS E TÉCNICOS ---
 PRECO_VENDA = {
     "Soja": 130.00, "Milho": 60.00, "Banana": 40.00, "Laranja": 35.00, 
     "Tomate Mesa": 75.00, "Cenoura": 55.00, "Pimentão": 45.00, 
@@ -48,7 +48,6 @@ CICLO_MEDIO_DIAS = {
     "Abacaxi": 540, "Maracujá": 240, "Alface": 45
 }
 
-# --- NOVO: Contexto para a IA saber o que é perene ---
 TIPO_CULTURA = {
     "Soja": "Ciclo Curto (Anual)",
     "Milho": "Ciclo Curto (Anual)",
@@ -90,63 +89,61 @@ def carregar_ml():
 @st.cache_resource
 def carregar_chroma():
     try:
+        # Tenta corrigir problema do SQLite em algumas nuvens
         __import__('pysqlite3')
         import sys
         sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
     except ImportError: pass
     
     try:
+        if not os.path.exists(DB_PATH): return None
         client = chromadb.PersistentClient(path=DB_PATH)
         emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
         return client.get_collection(name="manual_tecnico_agricola", embedding_function=emb_fn)
     except: return None
 
-# --- LLAMA 3.3 (CONSULTOR AGRÔNOMO ESPECIALISTA) ---
-def consultar_llama_online(cultura, cidade, lucro, risco, clima_texto, area_calc):
+# --- LLAMA 3.3 (AGORA COM RAG CONECTADO) ---
+def consultar_llama_online(cultura, cidade, lucro, risco, clima_texto, area_calc, texto_tecnico):
     api_key = st.secrets.get("GROQ_API_KEY")
     if not api_key: return "⚠️ Erro: Chave de API da Groq não configurada."
 
     client = Groq(api_key=api_key)
 
-    # 1. Pega o detalhe do ciclo (ex: "Árvore - 3 anos")
     info_ciclo = TIPO_CULTURA.get(cultura, "Ciclo Padrão")
     
-    # 2. Extrai a chuva do texto (Gambiarra inteligente para pegar o número)
-    # O texto vem como "Seco (1mm)" ou "Ideal (73mm)"
     chuva_match = re.search(r'\((\d+)mm\)', clima_texto)
     mm_chuva = int(chuva_match.group(1)) if chuva_match else 0
     
-    # 3. Cria alerta de irrigação se for seco (< 30mm)
     alerta_irrigacao = ""
     if mm_chuva < 30:
-        alerta_irrigacao = "ALERTA CRÍTICO: Baixa chuva. Deixe claro que SEM IRRIGAÇÃO o plantio é inviável nesta data, pois a muda vai morrer."
+        alerta_irrigacao = "ALERTA CRÍTICO: Baixa chuva. Avise que SEM IRRIGAÇÃO o plantio é inviável."
 
+    # Prompt Turbinado com o Knowledge Base
     prompt_usuario = f"""
-    Aja como um consultor agrônomo Sênior. Analise este cenário de investimento:
+    Aja como um Agrônomo Sênior. Analise este cenário:
     
-    DADOS TÉCNICOS:
+    DADOS DO PROJETO:
     - Município: {cidade}
     - Cultura: {cultura} ({info_ciclo})
-    - Área: {area_calc:.1f} hectares
-    - Clima/Chuva Hoje: {clima_texto}
+    - Área: {area_calc:.1f} ha
+    - Clima Hoje: {clima_texto}
     - {alerta_irrigacao}
-    
-    OBSERVAÇÃO IMPORTANTE:
-    O cálculo financeiro (R$ {lucro:,.0f}) é uma projeção anualizada de potencial produtivo.
-    Se a cultura for PERENE (Laranja, Café, etc), explique que esse lucro só vem com o pomar adulto e não no primeiro ano.
 
-    SUA RESPOSTA (Máximo 3 frases curtas e diretas):
-    1. Valide se o clima atual permite plantio (se precisar de água, fale).
-    2. Alerte sobre o tempo de retorno real (se for perene).
-    3. Dê um veredito final (Bom negócio ou Arriscado).
+    TRECHO DO MANUAL TÉCNICO (Use como referência extra):
+    "{texto_tecnico[:1000]}"  # Limitamos a 1000 caracteres para não estourar
+
+    SUA MISSÃO (Responda em 3 frases curtas):
+    1. Valide o clima/irrigação para a data.
+    2. Explique o tempo de retorno (se for perene) e cite algo do manual se for útil.
+    3. Dê o veredito (Lucro Projetado: R$ {lucro:,.0f}).
     """
 
     try:
         completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt_usuario}],
-            temperature=0.5, 
-            max_tokens=350,
+            temperature=0.4, 
+            max_tokens=400,
         )
         return completion.choices[0].message.content
     except Exception as e:
@@ -195,7 +192,6 @@ def recomendar_cultura(df, modelo, cidade, area_input, orcamento_max, ignorar_li
             if modelo:
                 prod_score = modelo.predict([[risco, chuva, temp, custo_base_ha, solo_val]])[0]
 
-        # --- LÓGICA DE ÁREA DINÂMICA ---
         custo_por_ha = custo_base_ha * FATOR_CUSTO.get(cultura, 1.0)
         
         if usar_todo_orcamento:
@@ -237,7 +233,7 @@ def recomendar_cultura(df, modelo, cidade, area_input, orcamento_max, ignorar_li
     
     return pd.DataFrame(resultados), culturas_existentes
 
-# --- CARD PERSONALIZADO ---
+# --- CARD UI ---
 def card_metrica(titulo, valor, cor="#000000"):
     st.markdown(f"""
     <div style="background-color: #f8f9fa; padding: 10px; border-radius: 8px; border: 1px solid #e9ecef; margin-bottom: 5px;">
@@ -246,13 +242,13 @@ def card_metrica(titulo, valor, cor="#000000"):
     </div>
     """, unsafe_allow_html=True)
 
-# --- UI ---
+# --- MAIN ---
 def main():
     st.title(f"AgroIA - Diagnóstico Inteligente")
     
     df = carregar_dados()
     modelo = carregar_ml()
-    chroma = carregar_chroma()
+    chroma = carregar_chroma() # Aqui carregamos o banco de vetores
     
     if df is None: st.error("Erro: Dados não encontrados."); st.stop()
 
@@ -309,7 +305,28 @@ def main():
                     with c4: card_metrica("Colheita", campeao['Colheita'])
                     with c5: card_metrica("Condição", campeao['Clima'], "#fd7e14")
                     
-                    parecer = consultar_llama_online(campeao['Cultura'], cidade, campeao['Lucro'], campeao['Risco'], campeao['Clima'], area_calculada)
+                    # --- BUSCA NO KNOWLEDGE BASE (RAG) ---
+                    texto_tecnico = ""
+                    if chroma:
+                        try:
+                            # Busca específica sobre a cultura campeã
+                            query = f"Manejo tecnico plantio {campeao['Cultura']}"
+                            results = chroma.query(query_texts=[query], n_results=1)
+                            if results['documents']:
+                                texto_tecnico = results['documents'][0][0]
+                        except Exception as e:
+                            print(f"Erro no Chroma: {e}")
+                    
+                    # Passamos o texto recuperado para a IA
+                    parecer = consultar_llama_online(
+                        campeao['Cultura'], 
+                        cidade, 
+                        campeao['Lucro'], 
+                        campeao['Risco'], 
+                        campeao['Clima'], 
+                        area_calculada,
+                        texto_tecnico # <--- AGORA SIM!
+                    )
                     
                     st.markdown(f"""
                     <div style="background-color: #e2e3e5; padding: 15px; border-radius: 8px; margin-top: 10px;">
